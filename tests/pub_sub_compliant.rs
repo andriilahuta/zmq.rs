@@ -117,7 +117,9 @@ mod test {
         let endpoints = vec![
             "tcp://127.0.0.1:0",
             "tcp://[::1]:0",
+            #[cfg(all(feature = "ipc-transport", target_family = "unix"))]
             "ipc://asdf.sock",
+            #[cfg(all(feature = "ipc-transport", target_family = "unix"))]
             "ipc://anothersocket-asdf",
         ];
         for e in endpoints {
