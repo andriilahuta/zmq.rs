@@ -70,14 +70,22 @@ impl SocketRecv for DealerSocket {
                     // Ignore non-message frames
                     continue;
                 }
-                Some((_peer_id, Err(e))) => {
+                Some((peer_id, Err(e))) => {
+                    self.backend.clone().peer_disconnected(&peer_id);
                     // Handle potential errors from the fair queue
                     return Err(e.into());
                 }
                 None => {
-                    // The fair queue is empty, which shouldn't happen in normal operation
-                    // We could either wait for more messages or return an error
-                    return Err(ZmqError::NoMessage);
+                    // All clients disconnected
+                    let backend = self.backend.clone();
+                    let mut peer_ids = Vec::with_capacity(backend.peers.len());
+                    for peer in &backend.peers {
+                        let peer_id = peer.key().clone();
+                        peer_ids.push(peer_id);
+                    }
+                    for peer_id in peer_ids {
+                        backend.clone().peer_disconnected(&peer_id);
+                    }
                 }
             };
         }

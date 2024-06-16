@@ -75,14 +75,22 @@ impl SocketRecv for RouterSocket {
                     continue;
                 }
                 Some((peer_id, Err(_e))) => {
-                    self.backend.peer_disconnected(&peer_id);
+                    self.backend.clone().peer_disconnected(&peer_id);
                     // We could take an approach of using `tracing` and have that be an optional feature
                     // tracing::error!("Error receiving message from peer {}: {:?}", peer_id, e);
                     continue;
                 }
                 None => {
-                    // The fair queue is empty, which shouldn't happen in normal operation
-                    return Err(ZmqError::NoMessage);
+                    // All clients disconnected
+                    let backend = self.backend.clone();
+                    let mut peer_ids = Vec::with_capacity(backend.peers.len());
+                    for peer in &backend.peers {
+                        let peer_id = peer.key().clone();
+                        peer_ids.push(peer_id);
+                    }
+                    for peer_id in peer_ids {
+                        backend.clone().peer_disconnected(&peer_id);
+                    }
                 }
             };
         }

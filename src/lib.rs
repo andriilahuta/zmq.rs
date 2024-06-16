@@ -185,9 +185,9 @@ impl SocketOptions {
 pub trait MultiPeerBackend: SocketBackend {
     /// This should not be public..
     /// Find a better way of doing this
-    async fn peer_connected(self: Arc<Self>, peer_id: &PeerIdentity, io: FramedIo);
+    async fn peer_connected(self: Arc<Self>, peer_id: &PeerIdentity, io: FramedIo, endpoint: Option<Endpoint>);
 
-    fn peer_disconnected(&self, peer_id: &PeerIdentity);
+    fn peer_disconnected(self: Arc<Self>, peer_id: &PeerIdentity);
 }
 
 pub trait SocketBackend: Send + Sync {
@@ -235,7 +235,7 @@ pub trait Socket: Sized + Send {
             let cloned_backend = cloned_backend.clone();
             async move {
                 let result = match result {
-                    Ok((socket, endpoint)) => util::peer_connected(socket, cloned_backend.clone())
+                    Ok((socket, endpoint)) => util::peer_connected(socket, cloned_backend.clone(), None)
                         .await
                         .map(|peer_id| (endpoint, peer_id)),
                     Err(e) => Err(e),
@@ -302,7 +302,7 @@ pub trait Socket: Sized + Send {
         let endpoint = TryIntoEndpoint::try_into(endpoint)?;
 
         let (socket, endpoint) = util::connect_forever(endpoint).await?;
-        let peer_id = util::peer_connected(socket, backend).await?;
+        let peer_id = util::peer_connected(socket, backend, Some(endpoint.clone())).await?;
 
         if let Some(monitor) = self.backend().monitor().lock().as_mut() {
             let _ = monitor.try_send(SocketEvent::Connected(endpoint, peer_id));

@@ -3,7 +3,7 @@ use crate::endpoint::Endpoint;
 use crate::error::ZmqResult;
 use crate::message::*;
 use crate::transport::AcceptStopHandle;
-use crate::util::PeerIdentity;
+use crate::util::{self, PeerIdentity};
 use crate::{async_rt, CaptureSocket, SocketOptions};
 use crate::{
     MultiPeerBackend, Socket, SocketBackend, SocketEvent, SocketSend, SocketType, ZmqError,
@@ -30,6 +30,7 @@ pub(crate) struct PubSocketBackend {
     subscribers: DashMap<PeerIdentity, Subscriber>,
     socket_monitor: Mutex<Option<mpsc::Sender<SocketEvent>>>,
     socket_options: SocketOptions,
+    connect_endpoints: DashMap<PeerIdentity, Endpoint>,
 }
 
 impl PubSocketBackend {
@@ -111,7 +112,12 @@ impl SocketBackend for PubSocketBackend {
 
 #[async_trait]
 impl MultiPeerBackend for PubSocketBackend {
-    async fn peer_connected(self: Arc<Self>, peer_id: &PeerIdentity, io: FramedIo) {
+    async fn peer_connected(
+        self: Arc<Self>,
+        peer_id: &PeerIdentity,
+        io: FramedIo,
+        endpoint: Option<Endpoint>,
+    ) {
         let (mut recv_queue, send_queue) = io.into_parts();
         // TODO provide handling for recv_queue
         let (sender, stop_receiver) = oneshot::channel();
@@ -123,6 +129,10 @@ impl MultiPeerBackend for PubSocketBackend {
                 _subscription_coro_stop: sender,
             },
         );
+        if let Some(e) = endpoint {
+            self.connect_endpoints.insert(peer_id.clone(), e);
+        }
+
         let backend = self;
         let peer_id = peer_id.clone();
         async_rt::task::spawn(async move {
@@ -152,9 +162,18 @@ impl MultiPeerBackend for PubSocketBackend {
         });
     }
 
-    fn peer_disconnected(&self, peer_id: &PeerIdentity) {
-        log::info!("Client disconnected {:?}", peer_id);
+    fn peer_disconnected(self: Arc<Self>, peer_id: &PeerIdentity) {
+        if let Some(monitor) = self.monitor().lock().as_mut() {
+            let _ = monitor.try_send(SocketEvent::Disconnected(peer_id.clone()));
+        }
+
         self.subscribers.remove(peer_id);
+
+        let Some((_, endpoint)) = self.connect_endpoints.remove(peer_id) else {
+            return;
+        };
+        let backend = self;
+        util::spawn_peer_reconnector(endpoint, backend);
     }
 }
 
@@ -207,7 +226,7 @@ impl SocketSend for PubSocket {
             }
         }
         for peer in dead_peers {
-            self.backend.peer_disconnected(&peer);
+            self.backend.clone().peer_disconnected(&peer);
         }
         Ok(())
     }
@@ -223,6 +242,7 @@ impl Socket for PubSocket {
                 subscribers: DashMap::new(),
                 socket_monitor: Mutex::new(None),
                 socket_options: options,
+                connect_endpoints: DashMap::new(),
             }),
             binds: HashMap::new(),
         }

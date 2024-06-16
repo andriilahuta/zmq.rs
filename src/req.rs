@@ -2,7 +2,7 @@ use crate::codec::*;
 use crate::endpoint::Endpoint;
 use crate::error::*;
 use crate::transport::AcceptStopHandle;
-use crate::util::{Peer, PeerIdentity};
+use crate::util::{self, Peer, PeerIdentity};
 use crate::*;
 use crate::{SocketType, ZmqResult};
 
@@ -20,6 +20,7 @@ struct ReqSocketBackend {
     pub(crate) round_robin: SegQueue<PeerIdentity>,
     socket_monitor: Mutex<Option<mpsc::Sender<SocketEvent>>>,
     socket_options: SocketOptions,
+    connect_endpoints: DashMap<PeerIdentity, Endpoint>,
 }
 
 pub struct ReqSocket {
@@ -117,6 +118,7 @@ impl Socket for ReqSocket {
                 round_robin: SegQueue::new(),
                 socket_monitor: Mutex::new(None),
                 socket_options: options,
+                connect_endpoints: DashMap::new(),
             }),
             current_request: None,
             binds: HashMap::new(),
@@ -140,7 +142,12 @@ impl Socket for ReqSocket {
 
 #[async_trait]
 impl MultiPeerBackend for ReqSocketBackend {
-    async fn peer_connected(self: Arc<Self>, peer_id: &PeerIdentity, io: FramedIo) {
+    async fn peer_connected(
+        self: Arc<Self>,
+        peer_id: &PeerIdentity,
+        io: FramedIo,
+        endpoint: Option<Endpoint>,
+    ) {
         let (recv_queue, send_queue) = io.into_parts();
         self.peers.insert(
             peer_id.clone(),
@@ -151,10 +158,24 @@ impl MultiPeerBackend for ReqSocketBackend {
             },
         );
         self.round_robin.push(peer_id.clone());
+
+        if let Some(e) = endpoint {
+            self.connect_endpoints.insert(peer_id.clone(), e);
+        }
     }
 
-    fn peer_disconnected(&self, peer_id: &PeerIdentity) {
+    fn peer_disconnected(self: Arc<Self>, peer_id: &PeerIdentity) {
+        if let Some(monitor) = self.monitor().lock().as_mut() {
+            let _ = monitor.try_send(SocketEvent::Disconnected(peer_id.clone()));
+        }
+
         self.peers.remove(peer_id);
+
+        let Some((_, endpoint)) = self.connect_endpoints.remove(peer_id) else {
+            return;
+        };
+        let backend = self;
+        util::spawn_peer_reconnector(endpoint, backend);
     }
 }
 

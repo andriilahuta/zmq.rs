@@ -24,6 +24,7 @@ struct RepSocketBackend {
     fair_queue_inner: Arc<Mutex<QueueInner<ZmqFramedRead, PeerIdentity>>>,
     socket_monitor: Mutex<Option<mpsc::Sender<SocketEvent>>>,
     socket_options: SocketOptions,
+    connect_endpoints: DashMap<PeerIdentity, Endpoint>,
 }
 
 pub struct RepSocket {
@@ -50,6 +51,7 @@ impl Socket for RepSocket {
                 fair_queue_inner: fair_queue.inner(),
                 socket_monitor: Mutex::new(None),
                 socket_options: options,
+                connect_endpoints: DashMap::new(),
             }),
             envelope: None,
             current_request: None,
@@ -75,7 +77,12 @@ impl Socket for RepSocket {
 
 #[async_trait]
 impl MultiPeerBackend for RepSocketBackend {
-    async fn peer_connected(self: Arc<Self>, peer_id: &PeerIdentity, io: FramedIo) {
+    async fn peer_connected(
+        self: Arc<Self>,
+        peer_id: &PeerIdentity,
+        io: FramedIo,
+        endpoint: Option<Endpoint>,
+    ) {
         let (recv_queue, send_queue) = io.into_parts();
 
         self.peers.insert(
@@ -88,13 +95,24 @@ impl MultiPeerBackend for RepSocketBackend {
         self.fair_queue_inner
             .lock()
             .insert(peer_id.clone(), recv_queue);
+
+            if let Some(e) = endpoint {
+                self.connect_endpoints.insert(peer_id.clone(), e);
+            }
     }
 
-    fn peer_disconnected(&self, peer_id: &PeerIdentity) {
+    fn peer_disconnected(self: Arc<Self>, peer_id: &PeerIdentity) {
         if let Some(monitor) = self.monitor().lock().as_mut() {
             let _ = monitor.try_send(SocketEvent::Disconnected(peer_id.clone()));
         }
+
         self.peers.remove(peer_id);
+
+        let Some((_, endpoint)) = self.connect_endpoints.remove(peer_id) else {
+            return;
+        };
+        let backend = self;
+        util::spawn_peer_reconnector(endpoint, backend);
     }
 }
 
@@ -171,7 +189,7 @@ impl SocketRecv for RepSocket {
                     }
                 },
                 Some((peer_id, Err(e))) => {
-                    self.backend.peer_disconnected(&peer_id);
+                    self.backend.clone().peer_disconnected(&peer_id);
                     return Err(e.into());
                 }
                 None => return Err(ZmqError::NoMessage),
