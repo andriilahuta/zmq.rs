@@ -159,13 +159,13 @@ where
                     if let Some(callback) = callback {
                         callback(event.key.clone());
                     }
-                    // Continue to poll other streams instead of returning None immediately.
-                    continue;
+
+                    return Poll::Ready(None);
                 }
                 Poll::Pending => {
                     let mut inner = fair_queue.inner.lock();
                     inner.streams.insert(event.key, io_stream);
-                    continue;
+                    return Poll::Pending;
                 }
             }
         }
@@ -313,8 +313,10 @@ mod test {
         }
 
         let mut results = Vec::new();
-        while let Some(i) = f_queue.next().await {
-            results.push(i);
+        for _ in 0..7 {
+            if let Some(i) = f_queue.next().await {
+                results.push(i);
+            }
         }
 
         // FairQueue continues polling all streams until all are exhausted

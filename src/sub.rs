@@ -1,7 +1,7 @@
 use crate::backend::{DisconnectNotifier, Peer};
 use crate::codec::{FramedIo, Message, ZmqFramedRead};
 use crate::endpoint::Endpoint;
-use crate::error::{ZmqError, ZmqResult};
+use crate::error::ZmqResult;
 use crate::fair_queue::FairQueue;
 use crate::fair_queue::QueueInner;
 use crate::message::ZmqMessage;
@@ -308,9 +308,15 @@ impl SocketRecv for SubSocket {
                     return Err(e.into());
                 }
                 None => {
-                    // The fair queue is empty, which shouldn't happen in normal operation
-                    // this can happen if the peer disconnects while we are polling
-                    return Err(ZmqError::NoMessage);
+                    // All clients disconnected
+                    let mut peer_ids = Vec::with_capacity(self.backend.peers.len());
+                    self.backend.peers.iter_sync(|peer_id, _peer| {
+                        peer_ids.push(peer_id.clone());
+                        true
+                    });
+                    for peer_id in peer_ids {
+                        self.backend.peer_disconnected(&peer_id);
+                    }
                 }
             }
         }
