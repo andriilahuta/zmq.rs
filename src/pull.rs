@@ -5,7 +5,7 @@ use crate::transport::AcceptStopHandle;
 use crate::util::PeerIdentity;
 use crate::{
     Endpoint, MultiPeerBackend, Socket, SocketEvent, SocketOptions, SocketRecv, SocketType,
-    ZmqError, ZmqMessage, ZmqResult,
+    ZmqMessage, ZmqResult,
 };
 
 use async_trait::async_trait;
@@ -78,8 +78,15 @@ impl SocketRecv for PullSocket {
                     return Err(e.into());
                 }
                 None => {
-                    // The fair queue is empty, which shouldn't happen in normal operation
-                    return Err(ZmqError::NoMessage);
+                    // All clients disconnected
+                    let mut peer_ids = Vec::with_capacity(self.backend.peers.len());
+                    self.backend.peers.iter_sync(|peer_id, _peer| {
+                        peer_ids.push(peer_id.clone());
+                        true
+                    });
+                    for peer_id in peer_ids {
+                        self.backend.peer_disconnected(&peer_id);
+                    }
                 }
             };
         }

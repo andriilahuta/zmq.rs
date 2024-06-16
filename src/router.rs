@@ -87,10 +87,7 @@ impl SocketRecv for RouterSocket {
                     // We could take an approach of using `tracing` and have that be an optional feature
                     // tracing::error!("Error receiving message from peer {}: {:?}", peer_id, e);
                 }
-                None => {
-                    // The fair queue is empty, which shouldn't happen in normal operation
-                    return Err(ZmqError::NoMessage);
-                }
+                None => {},
             };
         }
     }
