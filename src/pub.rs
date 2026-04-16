@@ -93,6 +93,7 @@ impl SocketBackend for PubSocketBackend {
 #[async_trait]
 impl MultiPeerBackend for PubSocketBackend {
     async fn peer_connected(self: Arc<Self>, peer_id: &PeerIdentity, io: FramedIo) {
+        log::warn!("Pub peer connected v1");
         let (mut recv_queue, send_queue) = io.into_parts();
         // TODO provide handling for recv_queue
         let (sender, stop_receiver) = oneshot::channel();
