@@ -1,5 +1,6 @@
-use crate::codec::{FramedIo, Message, ZmqFramedRead, ZmqFramedWrite};
+use crate::codec::{FramedIo, Message, ZmqCommand, ZmqFramedRead, ZmqFramedWrite};
 use crate::fair_queue::QueueInner;
+use crate::heartbeat::{ActivityTracker, HeartbeatConfig, spawn_heartbeat_task, HeartbeatHandle};
 use crate::util::PeerIdentity;
 use crate::{
     MultiPeerBackend, SocketBackend, SocketEvent, SocketOptions, SocketType, ZmqError, ZmqResult,
@@ -9,9 +10,11 @@ use async_trait::async_trait;
 use crossbeam_queue::SegQueue;
 use futures::channel::mpsc;
 use futures::SinkExt;
+use futures::future::BoxFuture;
 use parking_lot::Mutex;
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::Arc;
 
 /// Sender for notifying reconnection tasks when a peer disconnects.
@@ -30,6 +33,8 @@ pub(crate) struct GenericSocketBackend {
     pub(crate) socket_monitor: Mutex<Option<mpsc::Sender<SocketEvent>>>,
     /// Notifiers for reconnection tasks - keyed by `peer_id`
     disconnect_notifiers: Mutex<HashMap<PeerIdentity, DisconnectNotifier>>,
+    /// Heartbeat activity trackers and tasks per peer
+    pub(crate) heartbeats: Mutex<HashMap<PeerIdentity, (ActivityTracker, Option<HeartbeatHandle>)>>,
 }
 
 impl GenericSocketBackend {
@@ -46,6 +51,7 @@ impl GenericSocketBackend {
             socket_options: options,
             socket_monitor: Mutex::new(None),
             disconnect_notifiers: Mutex::new(HashMap::new()),
+            heartbeats: Mutex::new(HashMap::new()),
         }
     }
 
@@ -139,6 +145,66 @@ impl MultiPeerBackend for GenericSocketBackend {
         self.peers
             .upsert_async(peer_id.clone(), Peer { send_queue })
             .await;
+
+        // Initialize heartbeat tracker for this peer
+        let (activity_tracker, hb_handle) = if self.socket_options.heartbeat_enabled {
+            let config = self.socket_options.heartbeat_config.clone()
+                .unwrap_or_default();
+            let activity_tracker = ActivityTracker::new(config.clone());
+
+            // Spawn heartbeat task for this peer to send PINGs independently
+            let backend_weak = Arc::downgrade(&self);
+            let peer_id_for_task = peer_id.clone();
+            let heartbeat_clone = activity_tracker.clone();
+
+            let send_ping_callback = {
+                let peer_id = peer_id.clone();
+                let backend_weak = backend_weak.clone();
+                let config = config.clone();
+
+                move || {
+                    let peer_id = peer_id.clone();
+                    let backend_weak = backend_weak.clone();
+
+                    Box::pin(async move {
+                        if let Some(backend) = backend_weak.upgrade() {
+                            if let Some(mut peer) = backend.peers.get_async(&peer_id).await {
+                                let ping = ZmqCommand::ping(config.ttl, None);
+                                peer.send_queue.send(Message::Command(ping)).await
+                                    .map_err(|e| std::io::Error::new(ErrorKind::Other, e.to_string()))
+                            } else {
+                                Err(std::io::Error::new(ErrorKind::ConnectionAborted, "Peer not found"))
+                            }
+                        } else {
+                            Err(std::io::Error::new(ErrorKind::Other, "Backend dropped"))
+                        }
+                    }) as BoxFuture<'static, Result<(), std::io::Error>>
+                }
+            };
+
+            let on_timeout_callback = {
+                let peer_id = peer_id.clone();
+                let backend_weak = backend_weak.clone();
+
+                move || {
+                    if let Some(backend) = backend_weak.upgrade() {
+                        backend.peer_disconnected(&peer_id);
+                    }
+                    true // Signal to break the heartbeat loop
+                }
+            };
+
+            let hb_handle = spawn_heartbeat_task(heartbeat_clone, peer_id_for_task.clone(), send_ping_callback, on_timeout_callback);
+            (activity_tracker, Some(hb_handle))
+        } else {
+            // Heartbeat disabled - Create tracker for PONG responses only
+            let activity_tracker = ActivityTracker::new(HeartbeatConfig::default());
+            (activity_tracker, None)
+        };
+
+        // Store heartbeat handle if spawned
+        self.heartbeats.lock().insert(peer_id.clone(), (activity_tracker.clone(), hb_handle));
+
         self.round_robin.push(peer_id.clone());
         match &self.fair_queue_inner {
             None => {}
@@ -154,6 +220,7 @@ impl MultiPeerBackend for GenericSocketBackend {
         }
 
         self.peers.remove_sync(peer_id);
+        self.heartbeats.lock().remove(peer_id);
         match &self.fair_queue_inner {
             None => {}
             Some(inner) => {

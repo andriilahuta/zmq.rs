@@ -1,5 +1,5 @@
 use crate::backend::GenericSocketBackend;
-use crate::codec::{Message, ZmqFramedRead};
+use crate::codec::{Message, ZmqCommand, ZmqFramedRead};
 use crate::fair_queue::FairQueue;
 use crate::transport::AcceptStopHandle;
 use crate::util::PeerIdentity;
@@ -70,13 +70,74 @@ impl Socket for DealerSocket {
 #[async_trait]
 impl SocketRecv for DealerSocket {
     async fn recv(&mut self) -> ZmqResult<ZmqMessage> {
+        use crate::codec::{Message, ZmqCommandName};
+        use futures::SinkExt;
+
         loop {
             match self.fair_queue.next().await {
-                Some((_peer_id, Ok(Message::Message(message)))) => {
+                Some((peer_id, Ok(Message::Message(message)))) => {
+                    // Record heartbeat activity on message reception
+                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                        let activity_tracker = &mut heartbeat_tuple.0;
+                        activity_tracker.record_activity();
+
+                        // Check if connection is dead
+                        if activity_tracker.is_dead() {
+                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
+                            self.backend.peer_disconnected(&peer_id);
+                        }
+                    }
                     return Ok(message);
                 }
-                Some((_peer_id, Ok(_))) => {
-                    // Ignore non-message frames
+                Some((peer_id, Ok(Message::Command(cmd)))) => {
+                    // Handle heartbeat commands
+                    match cmd.name {
+                        ZmqCommandName::PING => {
+                            // Handle PING with TTL tracking
+                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.received_ping(cmd.ttl);
+                            }
+                            // Respond with PONG
+                            if let Some(mut peer) = self.backend.peers.get_async(&peer_id).await {
+                                let pong = ZmqCommand::pong(cmd.context.clone());
+                                let _ = peer.send_queue.send(Message::Command(pong)).await;
+                            }
+                        }
+                        ZmqCommandName::PONG => {
+                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.received_pong();
+                            }
+                        }
+                        _ => {
+                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.record_activity();
+                            }
+                        }
+                    }
+
+                    // Check if we should send a periodic PING
+                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                        let activity_tracker = &mut heartbeat_tuple.0;
+                        // Heartbeat task sends PINGs independently
+
+                        // Check if connection is dead
+                        if activity_tracker.is_dead() {
+                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
+                            self.backend.peer_disconnected(&peer_id);
+                        }
+                    }
+                }
+                Some((peer_id, Ok(Message::Greeting(_)))) => {
+                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                        let activity_tracker = &mut heartbeat_tuple.0;
+                        activity_tracker.record_activity();
+
+                        // Check if connection is dead
+                        if activity_tracker.is_dead() {
+                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
+                            self.backend.peer_disconnected(&peer_id);
+                        }
+                    }
                 }
                 Some((peer_id, Err(e))) => {
                     self.backend.peer_disconnected(&peer_id);
@@ -95,6 +156,17 @@ impl SocketRecv for DealerSocket {
                     }
                 }
             };
+
+            // Check if any peers have timed out
+            let mut timed_out_peers = Vec::new();
+            self.backend.heartbeats.lock().iter().for_each(|(peer_id, heartbeat_tuple)| {
+                if heartbeat_tuple.0.is_dead() {
+                    timed_out_peers.push(peer_id.clone());
+                }
+            });
+            for peer_id in timed_out_peers {
+                self.backend.peer_disconnected(&peer_id);
+            }
         }
     }
 }
@@ -185,12 +257,48 @@ impl CaptureSocket for DealerSendHalf {}
 #[async_trait]
 impl SocketRecv for DealerRecvHalf {
     async fn recv(&mut self) -> ZmqResult<ZmqMessage> {
+        use crate::codec::{Message, ZmqCommandName};
+        use futures::SinkExt;
+
         loop {
             match self.fair_queue.next().await {
-                Some((_peer_id, Ok(Message::Message(message)))) => {
+                Some((peer_id, Ok(Message::Message(message)))) => {
+                    // Record heartbeat activity on message reception
+                    if let Some(mut heartbeat_tuple) = self._inner.backend.heartbeats.lock().get_mut(&peer_id) {
+                        let activity_tracker = &mut heartbeat_tuple.0;
+                        activity_tracker.record_activity();
+                    }
                     return Ok(message);
                 }
-                Some((_peer_id, Ok(_))) => {}
+                Some((peer_id, Ok(Message::Command(cmd)))) => {
+                    // Handle heartbeat commands
+                    match cmd.name {
+                        ZmqCommandName::PING => {
+                            if let Some(mut heartbeat_tuple) = self._inner.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.received_ping(cmd.ttl);
+                            }
+                            if let Some(mut peer) = self._inner.backend.peers.get_async(&peer_id).await {
+                                let pong = ZmqCommand::pong(cmd.context.clone());
+                                let _ = peer.send_queue.send(Message::Command(pong)).await;
+                            }
+                        }
+                        ZmqCommandName::PONG => {
+                            if let Some(mut heartbeat_tuple) = self._inner.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.received_pong();
+                            }
+                        }
+                        _ => {
+                            if let Some(mut heartbeat_tuple) = self._inner.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.record_activity();
+                            }
+                        }
+                    }
+                }
+                Some((peer_id, Ok(Message::Greeting(_)))) => {
+                    if let Some(mut heartbeat_tuple) = self._inner.backend.heartbeats.lock().get_mut(&peer_id) {
+                        heartbeat_tuple.0.record_activity();
+                    }
+                }
                 Some((_peer_id, Err(e))) => {
                     return Err(e.into());
                 }

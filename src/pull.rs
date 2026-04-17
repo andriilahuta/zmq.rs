@@ -1,5 +1,5 @@
 use crate::backend::GenericSocketBackend;
-use crate::codec::{Message, ZmqFramedRead};
+use crate::codec::{Message, ZmqCommand, ZmqCommandName, ZmqFramedRead};
 use crate::fair_queue::FairQueue;
 use crate::transport::AcceptStopHandle;
 use crate::util::PeerIdentity;
@@ -10,7 +10,7 @@ use crate::{
 
 use async_trait::async_trait;
 use futures::channel::mpsc;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
@@ -66,11 +66,59 @@ impl SocketRecv for PullSocket {
     async fn recv(&mut self) -> ZmqResult<ZmqMessage> {
         loop {
             match self.fair_queue.next().await {
-                Some((_peer_id, Ok(Message::Message(message)))) => {
+                Some((peer_id, Ok(Message::Message(message)))) => {
+                    // Record heartbeat activity on message reception
+                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                        heartbeat_tuple.0.record_activity();
+
+                        // Check if connection is dead
+                        if heartbeat_tuple.0.is_dead() {
+                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
+                            self.backend.peer_disconnected(&peer_id);
+                        }
+                    }
                     return Ok(message);
                 }
-                Some((_peer_id, Ok(_msg))) => {
-                    // Ignore non-message frames (Command, Greeting) as PULL sockets are designed to only receive actual messages, not internal protocol frames.
+                Some((peer_id, Ok(Message::Command(cmd)))) => {
+                    // Handle heartbeat commands
+                    match cmd.name {
+                        ZmqCommandName::PING => {
+                            // Handle PING with TTL tracking
+                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.received_ping(cmd.ttl);
+                            }
+                            // Respond with PONG
+                            if let Some(mut peer) = self.backend.peers.get_async(&peer_id).await {
+                                let pong = ZmqCommand::pong(cmd.context.clone());
+                                let _ = peer.send_queue.send(Message::Command(pong)).await;
+                            }
+                        }
+                        ZmqCommandName::PONG => {
+                            // Record activity on PONG
+                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.received_pong();
+                            }
+                        }
+                        _ => {
+                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.record_activity();
+                            }
+                        }
+                    }
+
+                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                        // Check if connection is dead
+                        if heartbeat_tuple.0.is_dead() {
+                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
+                            self.backend.peer_disconnected(&peer_id);
+                        }
+                    }
+                }
+                Some((peer_id, Ok(Message::Greeting(_)))) => {
+                    // Record activity but skip greeting
+                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                        heartbeat_tuple.0.record_activity();
+                    }
                 }
                 Some((peer_id, Err(e))) => {
                     self.backend.peer_disconnected(&peer_id);
@@ -89,6 +137,17 @@ impl SocketRecv for PullSocket {
                     }
                 }
             };
+
+            // Check if any peers have timed out
+            let mut timed_out_peers = Vec::new();
+            self.backend.heartbeats.lock().iter().for_each(|(peer_id, heartbeat_tuple)| {
+                if heartbeat_tuple.0.is_dead() {
+                    timed_out_peers.push(peer_id.clone());
+                }
+            });
+            for peer_id in timed_out_peers {
+                self.backend.peer_disconnected(&peer_id);
+            }
         }
     }
 }

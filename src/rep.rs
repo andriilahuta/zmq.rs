@@ -3,16 +3,19 @@ use crate::codec::*;
 use crate::endpoint::Endpoint;
 use crate::error::*;
 use crate::fair_queue::{FairQueue, QueueInner};
+use crate::heartbeat::{ActivityTracker, HeartbeatConfig, spawn_heartbeat_task, HeartbeatHandle};
 use crate::reconnect::{ReconnectConfig, ReconnectHandle};
 use crate::transport::AcceptStopHandle;
 use crate::*;
 use crate::{SocketType, ZmqResult};
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::Arc;
 
 struct RepPeer {
@@ -27,6 +30,8 @@ struct RepSocketBackend {
     socket_options: SocketOptions,
     /// Notifiers for reconnection tasks - keyed by `peer_id`
     disconnect_notifiers: Mutex<HashMap<PeerIdentity, DisconnectNotifier>>,
+    /// Heartbeat activity trackers and tasks per peer
+    heartbeats: Mutex<HashMap<PeerIdentity, (ActivityTracker, Option<HeartbeatHandle>)>>,
 }
 
 impl RepSocketBackend {
@@ -78,6 +83,7 @@ impl Socket for RepSocket {
             socket_monitor: Mutex::new(None),
             socket_options: options,
             disconnect_notifiers: Mutex::new(HashMap::new()),
+            heartbeats: Mutex::new(HashMap::new()),
         });
 
         let backend_weak = Arc::downgrade(&backend);
@@ -165,6 +171,65 @@ impl MultiPeerBackend for RepSocketBackend {
                 },
             )
             .await;
+
+        // Initialize heartbeat tracker for this peer and spawn task if enabled
+        let (activity_tracker, hb_handle) = if self.socket_options.heartbeat_enabled {
+            let config = self.socket_options.heartbeat_config.clone()
+                .unwrap_or_default();
+            let activity_tracker = ActivityTracker::new(config.clone());
+
+            // Spawn heartbeat task for this peer to send PINGs independently
+            let backend_weak = Arc::downgrade(&self);
+            let peer_id_for_task = peer_id.clone();
+            let heartbeat_clone = activity_tracker.clone();
+
+            let send_ping_callback = {
+                let peer_id = peer_id.clone();
+                let backend_weak = backend_weak.clone();
+                let config = config.clone();
+
+                move || {
+                    let peer_id = peer_id.clone();
+                    let backend_weak = backend_weak.clone();
+
+                    Box::pin(async move {
+                        if let Some(backend) = backend_weak.upgrade() {
+                            if let Some(mut peer) = backend.peers.get_async(&peer_id).await {
+                                let ping = ZmqCommand::ping(config.ttl, None);
+                                peer.send_queue.send(Message::Command(ping)).await
+                                    .map_err(|e| std::io::Error::new(ErrorKind::Other, e.to_string()))
+                            } else {
+                                Err(std::io::Error::new(ErrorKind::ConnectionAborted, "Peer not found"))
+                            }
+                        } else {
+                            Err(std::io::Error::new(ErrorKind::Other, "Backend dropped"))
+                        }
+                    }) as BoxFuture<'static, Result<(), std::io::Error>>
+                }
+            };
+
+            let on_timeout_callback = {
+                let peer_id = peer_id.clone();
+                let backend_weak = backend_weak.clone();
+
+                move || {
+                    if let Some(backend) = backend_weak.upgrade() {
+                        backend.peer_disconnected(&peer_id);
+                    }
+                    true // Signal to break the heartbeat loop
+                }
+            };
+
+            let hb_handle = spawn_heartbeat_task(heartbeat_clone, peer_id_for_task.clone(), send_ping_callback, on_timeout_callback);
+            (activity_tracker, Some(hb_handle))
+        } else {
+            // Heartbeat disabled - Create tracker for PONG responses only
+            let activity_tracker = ActivityTracker::new(HeartbeatConfig::default());
+            (activity_tracker, None)
+        };
+
+        self.heartbeats.lock().insert(peer_id.clone(), (activity_tracker.clone(), hb_handle));
+
         self.fair_queue_inner
             .lock()
             .insert(peer_id.clone(), recv_queue);
@@ -176,6 +241,7 @@ impl MultiPeerBackend for RepSocketBackend {
         }
         self.peers.remove_sync(peer_id);
         self.fair_queue_inner.lock().remove(peer_id);
+        self.heartbeats.lock().remove(peer_id);
 
         // Notify reconnection task if registered
         if let Some(mut notifier) = self.disconnect_notifiers.lock().remove(peer_id) {
@@ -238,28 +304,70 @@ impl SocketRecv for RepSocket {
     async fn recv(&mut self) -> ZmqResult<ZmqMessage> {
         loop {
             match self.fair_queue.next().await {
-                Some((peer_id, Ok(message))) => match message {
-                    Message::Message(mut m) => {
-                        if m.len() < 2 {
-                            return Err(ZmqError::Other("Invalid message format"));
+                Some((peer_id, Ok(message))) => {
+                    // Record heartbeat activity and check for timeout
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get(&peer_id) {
+                        if heartbeat_tuple.0.is_dead() {
+                            self.backend.peer_disconnected(&peer_id);
+                            continue;
                         }
-                        let mut at = 1;
-                        for (index, frame) in m.iter().enumerate() {
-                            if frame.is_empty() {
-                                // Include delimiter in envelope.
-                                at = index + 1;
-                                break;
+                    }
+
+                    match message {
+                        Message::Message(mut m) => {
+                            // Record activity on message reception
+                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.record_activity();
+
+                            }
+                            let mut at = 1;
+                            for (index, frame) in m.iter().enumerate() {
+                                if frame.is_empty() {
+                                    // Include delimiter in envelope.
+                                    at = index + 1;
+                                    break;
+                                }
+                            }
+                            let data = m.split_off(at);
+                            self.envelope = Some(m);
+                            self.current_request = Some(peer_id);
+                            return Ok(data);
+                        }
+                        Message::Command(cmd) => {
+                            // Handle heartbeat commands
+                            match cmd.name {
+                                ZmqCommandName::PING => {
+                                    // Handle PING with TTL tracking
+                                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                        heartbeat_tuple.0.received_ping(cmd.ttl);
+                                    }
+                                    // Respond with PONG
+                                    if let Some(mut peer) = self.backend.peers.get_async(&peer_id).await {
+                                        let pong = ZmqCommand::pong(cmd.context.clone());
+                                        let _ = peer.send_queue.send(Message::Command(pong)).await;
+                                    }
+                                }
+                                ZmqCommandName::PONG => {
+                                    // Record activity on PONG
+                                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                        heartbeat_tuple.0.received_pong();
+                                    }
+                                }
+                                _ => {
+                                    // Other commands are unexpected
+                                }
+                            }
+
+                            // Heartbeat task sends PINGs independently
+                        }
+                        Message::Greeting(_) => {
+                            // Record activity but skip greeting
+                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                heartbeat_tuple.0.record_activity();
                             }
                         }
-                        let data = m.split_off(at);
-                        self.envelope = Some(m);
-                        self.current_request = Some(peer_id);
-                        return Ok(data);
                     }
-                    Message::Greeting(_) | Message::Command(_) => {
-                        // Ignore non-message frames. REP sockets should only process actual messages.
-                    }
-                },
+                }
                 Some((peer_id, Err(e))) => {
                     self.backend.peer_disconnected(&peer_id);
                     return Err(e.into());

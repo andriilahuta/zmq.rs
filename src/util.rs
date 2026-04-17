@@ -7,6 +7,7 @@ use futures::{SinkExt, StreamExt};
 use rand::Rng;
 
 use std::convert::{TryFrom, TryInto};
+use std::io::ErrorKind;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -178,6 +179,11 @@ pub(crate) async fn ready_exchange(
                     ))
                 }
             }
+            ZmqCommandName::PING | ZmqCommandName::PONG => {
+                Err(ZmqError::Other(
+                    "Unexpected PING/PONG during handshake",
+                ))
+            }
         },
         Some(Ok(_)) => Err(ZmqError::Other("Failed to confirm ready state")),
         Some(Err(e)) => Err(e.into()),
@@ -206,7 +212,7 @@ pub(crate) async fn connect_forever(endpoint: Endpoint) -> ZmqResult<(FramedIo, 
     loop {
         match transport::connect(&endpoint).await {
             Ok(res) => return Ok(res),
-            Err(ZmqError::Network(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            Err(ZmqError::Network(e)) if e.kind() == ErrorKind::ConnectionRefused => {
                 if try_num < 5 {
                     try_num += 1;
                 }
