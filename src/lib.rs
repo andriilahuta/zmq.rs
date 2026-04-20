@@ -174,11 +174,20 @@ pub enum SocketEvent {
     Disconnected(PeerIdentity),
 }
 
-#[derive(Default)]
 pub struct SocketOptions {
     pub(crate) peer_id: Option<PeerIdentity>,
     pub(crate) heartbeat_enabled: bool,
     pub(crate) heartbeat_config: Option<crate::heartbeat::HeartbeatConfig>,
+}
+
+impl Default for SocketOptions {
+    fn default() -> Self {
+        Self {
+            peer_id: None,
+            heartbeat_enabled: true,
+            heartbeat_config: None,
+        }
+    }
 }
 
 impl SocketOptions {
@@ -187,7 +196,7 @@ impl SocketOptions {
         self
     }
 
-    /// Enable or disable heartbeat functionality (disabled by default)
+    /// Enable or disable heartbeat functionality (enabled by default)
     pub fn heartbeat(&mut self, enabled: bool) -> &mut Self {
         self.heartbeat_enabled = enabled;
         self
