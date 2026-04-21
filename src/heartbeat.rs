@@ -9,8 +9,10 @@
 //! 1. **ActivityTracker** - Tracks peer state
 //! 2. **HeartbeatTask** - Separate background task that sends PINGs periodically
 
+use crate::async_rt::task::timeout;
 use crate::util::PeerIdentity;
 use crate::async_rt;
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,15 +37,21 @@ pub struct HeartbeatConfig {
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
-            // Send heartbeat every 60 seconds
-            ping_interval: Duration::from_secs(60),
+            // Send heartbeat every 15 seconds
+            ping_interval: Duration::from_secs(15),
             // Wait 2x the ping interval for response
-            timeout: Duration::from_secs(120),
-            // TTL = 2x the ping interval = 1200 tenths of seconds = 120 seconds
-            ttl: Some(1200),
+            timeout: Duration::from_secs(60),
+            // TTL = 2x the ping interval = 600 tenths of seconds = 60 seconds
+            ttl: Some(600),
             // Limit unanswered PINGs to 3 to prevent PONG storms
             max_unanswered_pings: 3,
         }
+    }
+}
+
+impl HeartbeatConfig {
+    pub fn send_ping_timeout(&self) -> Duration {
+        self.ping_interval
     }
 }
 
@@ -70,15 +78,19 @@ pub struct ActivityTracker {
     last_activity_ms: Arc<AtomicU64>,
     /// TTL received from PING command (in milliseconds). Separate timeout from activity timeout.
     ttl_deadline_ms: Arc<AtomicU64>,
+    /// Last time a PING was sent (in milliseconds). Used to enforce minimum interval between PINGs.
+    last_ping_ms: Arc<AtomicU64>,
 }
 
 impl ActivityTracker {
     pub fn new(config: HeartbeatConfig) -> Self {
+        let now = current_time_ms();
         Self {
-            last_activity_ms: Arc::new(AtomicU64::new(current_time_ms())),
+            last_activity_ms: Arc::new(AtomicU64::new(now)),
             config,
             unanswered_pings: Arc::new(AtomicU32::new(0)),
             ttl_deadline_ms: Arc::new(AtomicU64::new(0)),
+            last_ping_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -112,7 +124,8 @@ impl ActivityTracker {
     ///
     /// Returns true if:
     /// 1. Time since last activity >= ping_interval, AND
-    /// 2. Unanswered PING count < max_unanswered_pings (PONG storm prevention)
+    /// 2. Time since last PING send >= ping_interval (enforces minimum interval), AND
+    /// 3. Unanswered PING count < max_unanswered_pings (PONG storm prevention)
     pub fn should_send_ping(&self) -> bool {
         let unanswered = self.unanswered_pings.load(Ordering::Relaxed);
         if unanswered >= self.config.max_unanswered_pings {
@@ -120,6 +133,17 @@ impl ActivityTracker {
         }
 
         let now = current_time_ms();
+
+        // Enforce minimum interval since last PING was sent
+        let last_ping_ms = self.last_ping_ms.load(Ordering::Relaxed);
+        if last_ping_ms > 0 {
+            let elapsed_since_last_ping = Duration::from_millis(now.saturating_sub(last_ping_ms));
+            if elapsed_since_last_ping < self.config.ping_interval {
+                return false;
+            }
+        }
+
+        // Check if time since last activity >= ping_interval
         let last_activity = self.last_activity_ms.load(Ordering::Relaxed);
         let elapsed = Duration::from_millis(now.saturating_sub(last_activity));
         elapsed >= self.config.ping_interval
@@ -128,6 +152,7 @@ impl ActivityTracker {
     /// Call this after successfully sending a PING command
     pub fn sent_ping(&self) {
         self.unanswered_pings.fetch_add(1, Ordering::Relaxed);
+        self.last_ping_ms.store(current_time_ms(), Ordering::Relaxed);
     }
 
     /// Call this when PONG is received
@@ -258,7 +283,7 @@ impl Drop for HeartbeatHandle {
 /// # Returns
 /// A `HeartbeatHandle` to control the task
 pub fn spawn_heartbeat_task<SendFn, TimeoutFn>(
-    heartbeat: ActivityTracker,
+    activity_tracker: ActivityTracker,
     peer_id: PeerIdentity,
     mut send_ping: SendFn,
     on_timeout: TimeoutFn,
@@ -274,6 +299,7 @@ where
     let on_timeout_clone = on_timeout.clone();
 
     async_rt::task::spawn(async move {
+        log::debug!("Heartbeat task started for peer {:?}", peer_id_clone);
         let mut shutdown_rx = shutdown_rx.fuse();
         const CHECK_INTERVAL_MS: u64 = 500; // Check every 500ms if PING should be sent
 
@@ -287,7 +313,7 @@ where
                 }
                 _ = sleep_future.fuse() => {
                     // Check if connection is dead
-                    if heartbeat.is_dead() {
+                    if activity_tracker.is_dead() {
                         log::warn!("Heartbeat timeout detected for peer {:?}", peer_id_clone);
                         // Call on_timeout callback; if it returns true, break the loop
                         if on_timeout_clone() {
@@ -297,10 +323,12 @@ where
                     }
 
                     // Check if we should send a PING
-                    if heartbeat.should_send_ping() {
-                        match send_ping().await {
-                            Ok(_) => {
-                                heartbeat.sent_ping();
+                    if activity_tracker.should_send_ping() {
+                        match timeout(activity_tracker.config.send_ping_timeout(), send_ping()).await
+                                .map_err(|e| std::io::Error::new(ErrorKind::TimedOut, e.to_string()))
+                                .and_then(|x| x) {
+                            Ok(()) => {
+                                activity_tracker.sent_ping();
                                 log::debug!("Sent PING to peer {:?}", peer_id_clone);
                             }
                             Err(e) => {

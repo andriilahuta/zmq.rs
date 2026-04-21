@@ -139,6 +139,7 @@ impl MultiPeerBackend for PubSocketBackend {
                 move || {
                     let peer_id = peer_id.clone();
                     let backend_weak = backend_weak.clone();
+                    let config = config.clone();
 
                     Box::pin(async move {
                         if let Some(backend) = backend_weak.upgrade() {
@@ -169,10 +170,8 @@ impl MultiPeerBackend for PubSocketBackend {
                 move || {
                     if let Some(backend) = backend_weak.upgrade() {
                         backend.peer_disconnected(&peer_id);
-                        true // Signal to break the heartbeat loop
-                    } else {
-                        true // Can't reach backend, exit
                     }
+                    true // Signal to break the heartbeat loop
                 }
             };
 

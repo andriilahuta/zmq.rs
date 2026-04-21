@@ -68,14 +68,8 @@ impl SocketRecv for PullSocket {
             match self.fair_queue.next().await {
                 Some((peer_id, Ok(Message::Message(message)))) => {
                     // Record heartbeat activity on message reception
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                         heartbeat_tuple.0.record_activity();
-
-                        // Check if connection is dead
-                        if heartbeat_tuple.0.is_dead() {
-                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
                     }
                     return Ok(message);
                 }
@@ -84,7 +78,7 @@ impl SocketRecv for PullSocket {
                     match cmd.name {
                         ZmqCommandName::PING => {
                             // Handle PING with TTL tracking
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.received_ping(cmd.ttl);
                             }
                             // Respond with PONG
@@ -95,28 +89,21 @@ impl SocketRecv for PullSocket {
                         }
                         ZmqCommandName::PONG => {
                             // Record activity on PONG
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.received_pong();
                             }
                         }
                         _ => {
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.record_activity();
                             }
                         }
                     }
 
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
-                        // Check if connection is dead
-                        if heartbeat_tuple.0.is_dead() {
-                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
-                    }
                 }
                 Some((peer_id, Ok(Message::Greeting(_)))) => {
                     // Record activity but skip greeting
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                         heartbeat_tuple.0.record_activity();
                     }
                 }

@@ -165,6 +165,7 @@ impl MultiPeerBackend for GenericSocketBackend {
                 move || {
                     let peer_id = peer_id.clone();
                     let backend_weak = backend_weak.clone();
+                    let config = config.clone();
 
                     Box::pin(async move {
                         if let Some(backend) = backend_weak.upgrade() {

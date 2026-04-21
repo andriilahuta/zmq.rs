@@ -155,6 +155,7 @@ impl MultiPeerBackend for SubSocketBackend {
                 move || {
                     let peer_id = peer_id.clone();
                     let backend_weak = backend_weak.clone();
+                    let config = config.clone();
 
                     Box::pin(async move {
                         use crate::codec::ZmqCommand;
@@ -366,14 +367,8 @@ impl SocketRecv for SubSocket {
             match self.fair_queue.next().await {
                 Some((peer_id, Ok(Message::Message(message)))) => {
                     // Record heartbeat activity on message reception
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                         heartbeat_tuple.0.record_activity();
-
-                        // Check if connection is dead due to heartbeat timeout
-                        if heartbeat_tuple.0.is_dead() {
-                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
                     }
                     return Ok(message);
                 }
@@ -382,7 +377,7 @@ impl SocketRecv for SubSocket {
                     match cmd.name {
                         ZmqCommandName::PING => {
                             // Handle PING with TTL tracking
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.received_ping(cmd.ttl);
                             }
                             // Respond with PONG
@@ -392,36 +387,23 @@ impl SocketRecv for SubSocket {
                             }
                         }
                         ZmqCommandName::PONG => {
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.received_pong();
                             }
                         }
                         _ => {
                             // Other commands are unexpected
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.record_activity();
                             }
                         }
                     }
 
-                    // Check if connection is dead due to heartbeat timeout
-                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get(&peer_id) {
-                        if heartbeat_tuple.0.is_dead() {
-                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
-                    }
                 }
                 Some((peer_id, Ok(Message::Greeting(_)))) => {
                     // Record activity but skip greeting
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                         heartbeat_tuple.0.record_activity();
-
-                        // Check if connection is dead
-                        if heartbeat_tuple.0.is_dead() {
-                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
                     }
                 }
                 Some((peer_id, Err(e))) => {
@@ -450,6 +432,7 @@ impl SocketRecv for SubSocket {
                 }
             });
             for peer_id in timed_out_peers {
+                log::warn!("Heartbeat timeout for peer {:?}", peer_id);
                 self.backend.peer_disconnected(&peer_id);
             }
         }

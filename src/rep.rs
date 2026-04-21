@@ -191,6 +191,7 @@ impl MultiPeerBackend for RepSocketBackend {
                 move || {
                     let peer_id = peer_id.clone();
                     let backend_weak = backend_weak.clone();
+                    let config = config.clone();
 
                     Box::pin(async move {
                         if let Some(backend) = backend_weak.upgrade() {
@@ -305,18 +306,10 @@ impl SocketRecv for RepSocket {
         loop {
             match self.fair_queue.next().await {
                 Some((peer_id, Ok(message))) => {
-                    // Record heartbeat activity and check for timeout
-                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get(&peer_id) {
-                        if heartbeat_tuple.0.is_dead() {
-                            self.backend.peer_disconnected(&peer_id);
-                            continue;
-                        }
-                    }
-
                     match message {
                         Message::Message(mut m) => {
                             // Record activity on message reception
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.record_activity();
 
                             }
@@ -338,7 +331,7 @@ impl SocketRecv for RepSocket {
                             match cmd.name {
                                 ZmqCommandName::PING => {
                                     // Handle PING with TTL tracking
-                                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                         heartbeat_tuple.0.received_ping(cmd.ttl);
                                     }
                                     // Respond with PONG
@@ -349,7 +342,7 @@ impl SocketRecv for RepSocket {
                                 }
                                 ZmqCommandName::PONG => {
                                     // Record activity on PONG
-                                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                         heartbeat_tuple.0.received_pong();
                                     }
                                 }
@@ -362,7 +355,7 @@ impl SocketRecv for RepSocket {
                         }
                         Message::Greeting(_) => {
                             // Record activity but skip greeting
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.record_activity();
                             }
                         }
@@ -374,6 +367,18 @@ impl SocketRecv for RepSocket {
                 }
                 None => {},
             };
+
+            // Check if any peers have timed out
+            let mut timed_out_peers = Vec::new();
+            self.backend.heartbeats.lock().iter().for_each(|(peer_id, heartbeat_tuple)| {
+                if heartbeat_tuple.0.is_dead() {
+                    timed_out_peers.push(peer_id.clone());
+                }
+            });
+            for peer_id in timed_out_peers {
+                log::warn!("Heartbeat timeout for peer {:?}", peer_id);
+                self.backend.peer_disconnected(&peer_id);
+            }
         }
     }
 }

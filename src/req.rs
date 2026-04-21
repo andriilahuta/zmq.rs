@@ -111,6 +111,7 @@ impl SocketRecv for ReqSocket {
                     // Check if peer is dead (heartbeat timeout)
                     if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get(&peer_id) {
                         if heartbeat_tuple.0.is_dead() {
+                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
                             self.backend.peer_disconnected(&peer_id);
                             return Err(ZmqError::Other("Peer heartbeat timeout"));
                         }
@@ -119,7 +120,7 @@ impl SocketRecv for ReqSocket {
                     match peer.recv_queue.next().await {
                         Some(Ok(Message::Message(mut m))) => {
                             // Record activity on message reception
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.record_activity();
                             }
 
@@ -143,7 +144,7 @@ impl SocketRecv for ReqSocket {
                                     if let Some(mut peer_send) = self.backend.peers.get_async(&peer_id).await {
                                         let _ = peer_send.send_queue.send(Message::Command(pong)).await;
                                     }
-                                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                         heartbeat_tuple.0.received_ping(cmd.ttl);
                                     }
                                     // Put peer_id back for next recv attempt
@@ -152,7 +153,7 @@ impl SocketRecv for ReqSocket {
                                     self.recv().await
                                 }
                                 ZmqCommandName::PONG => {
-                                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                         heartbeat_tuple.0.received_pong();
                                     }
                                     // Put peer_id back for next recv attempt
@@ -168,7 +169,7 @@ impl SocketRecv for ReqSocket {
                         }
                         Some(Ok(Message::Greeting(_))) => {
                             // Skip greeting messages (shouldn't occur after connection)
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.record_activity();
                             }
                             self.current_request = Some(peer_id);
@@ -292,6 +293,7 @@ impl MultiPeerBackend for ReqSocketBackend {
                 move || {
                     let peer_id = peer_id.clone();
                     let backend_weak = backend_weak.clone();
+                    let config = config.clone();
 
                     Box::pin(async move {
                         if let Some(backend) = backend_weak.upgrade() {

@@ -78,15 +78,8 @@ impl SocketRecv for RouterSocket {
             match self.fair_queue.next().await {
                 Some((peer_id, Ok(Message::Message(mut message)))) => {
                     // Record heartbeat activity on message reception
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
-                        let activity_tracker = &mut heartbeat_tuple.0;
-                        activity_tracker.record_activity();
-
-                        // Check if connection is dead
-                        if activity_tracker.is_dead() {
-                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                        heartbeat_tuple.0.record_activity();
                     }
                     message.push_front(peer_id.into());
                     return Ok(message);
@@ -96,7 +89,7 @@ impl SocketRecv for RouterSocket {
                     match cmd.name {
                         ZmqCommandName::PING => {
                             // Handle PING with TTL tracking
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.received_ping(cmd.ttl);
                             }
                             // Respond with PONG
@@ -106,36 +99,21 @@ impl SocketRecv for RouterSocket {
                             }
                         }
                         ZmqCommandName::PONG => {
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.received_pong();
                             }
                         }
                         _ => {
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.record_activity();
                             }
                         }
                     }
 
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
-                        let activity_tracker = &mut heartbeat_tuple.0;
-
-                        // Check if connection is dead
-                        if activity_tracker.is_dead() {
-                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
-                    }
                 }
                 Some((peer_id, Ok(Message::Greeting(_)))) => {
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                         heartbeat_tuple.0.record_activity();
-
-                        // Check if connection is dead
-                        if heartbeat_tuple.0.is_dead() {
-                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
                     }
                 }
                 Some((peer_id, Err(_e))) => {
@@ -261,8 +239,15 @@ impl SocketRecv for RouterRecvHalf {
             match self.fair_queue.next().await {
                 Some((peer_id, Ok(Message::Message(mut message)))) => {
                     // Record heartbeat activity on message reception
-                    if let Some(mut heartbeat_tuple) = self.inner.backend.heartbeats.lock().get_mut(&peer_id) {
-                        heartbeat_tuple.0.record_activity();
+                    if let Some(heartbeat_tuple) = self.inner.backend.heartbeats.lock().get_mut(&peer_id) {
+                        let activity_tracker = &mut heartbeat_tuple.0;
+                        activity_tracker.record_activity();
+
+                        // Check if connection is dead
+                        if activity_tracker.is_dead() {
+                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
+                            self.inner.backend.peer_disconnected(&peer_id);
+                        }
                     }
                     message.push_front(peer_id.into());
                     return Ok(message);
@@ -271,7 +256,7 @@ impl SocketRecv for RouterRecvHalf {
                     // Handle heartbeat commands
                     match cmd.name {
                         ZmqCommandName::PING => {
-                            if let Some(mut heartbeat_tuple) = self.inner.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.inner.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.received_ping(cmd.ttl);
                             }
                             if let Some(mut peer) = self.inner.backend.peers.get_async(&peer_id).await {
@@ -280,20 +265,20 @@ impl SocketRecv for RouterRecvHalf {
                             }
                         }
                         ZmqCommandName::PONG => {
-                            if let Some(mut heartbeat_tuple) = self.inner.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.inner.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.received_pong();
                             }
                         }
                         _ => {
                             // Other commands are unexpected
-                            if let Some(mut heartbeat_tuple) = self.inner.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.inner.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.record_activity();
                             }
                         }
                     }
                 }
                 Some((peer_id, Ok(Message::Greeting(_)))) => {
-                    if let Some(mut heartbeat_tuple) = self.inner.backend.heartbeats.lock().get_mut(&peer_id) {
+                    if let Some(heartbeat_tuple) = self.inner.backend.heartbeats.lock().get_mut(&peer_id) {
                         heartbeat_tuple.0.record_activity();
                     }
                 }

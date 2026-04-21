@@ -130,6 +130,7 @@ impl MultiPeerBackend for XPubSocketBackend {
                 move || {
                     let peer_id = peer_id.clone();
                     let backend_weak = backend_weak.clone();
+                    let config = config.clone();
 
                     Box::pin(async move {
                         if let Some(backend) = backend_weak.upgrade() {
@@ -250,14 +251,8 @@ impl SocketRecv for XPubSocket {
             match self.fair_queue.next().await {
                 Some((peer_id, Ok(Message::Message(message)))) => {
                     // Record heartbeat activity on message reception
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                         heartbeat_tuple.0.record_activity();
-
-                        // Check if connection is dead
-                        if heartbeat_tuple.0.is_dead() {
-                            log::warn!("Heartbeat timeout for subscriber {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
                     }
                     // Process the subscription message internally to update tracking
                     self.backend
@@ -273,39 +268,25 @@ impl SocketRecv for XPubSocket {
                                 let pong = ZmqCommand::pong(cmd.context.clone());
                                 let _ = subscriber.send_queue.send(Message::Command(pong)).await;
                             }
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.received_ping(cmd.ttl);
                             }
                         }
                         ZmqCommandName::PONG => {
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.received_pong();
                             }
                         }
                         _ => {
-                            if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                            if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                                 heartbeat_tuple.0.record_activity();
                             }
                         }
                     }
-
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
-                        // Check if connection is dead
-                        if heartbeat_tuple.0.is_dead() {
-                            log::warn!("Heartbeat timeout for subscriber {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
-                    }
                 }
                 Some((peer_id, Ok(Message::Greeting(_)))) => {
-                    if let Some(mut heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id) {
                         heartbeat_tuple.0.record_activity();
-
-                        // Check if connection is dead
-                        if heartbeat_tuple.0.is_dead() {
-                            log::warn!("Heartbeat timeout for subscriber {:?}", peer_id);
-                            self.backend.peer_disconnected(&peer_id);
-                        }
                     }
                 }
                 Some((peer_id, Err(e))) => {
@@ -315,6 +296,18 @@ impl SocketRecv for XPubSocket {
                 None => {
                     return Err(ZmqError::NoMessage);
                 }
+            };
+
+            // Check if any peers have timed out
+            let mut timed_out_peers = Vec::new();
+            self.backend.heartbeats.lock().iter().for_each(|(peer_id, heartbeat_tuple)| {
+                if heartbeat_tuple.0.is_dead() {
+                    timed_out_peers.push(peer_id.clone());
+                }
+            });
+            for peer_id in timed_out_peers {
+                log::warn!("Heartbeat timeout for peer {:?}", peer_id);
+                self.backend.peer_disconnected(&peer_id);
             }
         }
     }
