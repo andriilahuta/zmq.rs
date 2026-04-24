@@ -74,13 +74,51 @@ impl SocketRecv for RouterSocket {
         loop {
             match self.fair_queue.next().await {
                 Some((peer_id, Ok(Message::Message(mut message)))) => {
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id)
+                    {
+                        heartbeat_tuple.0.record_activity();
+                    }
                     message.push_front(peer_id.into());
                     return Ok(message);
                 }
-                Some((_peer_id, Ok(_msg))) => {
-                    // todo: Log or handle other message types if needed
-                    // We could take an approach of using `tracing` and have that be an optional feature
-                    // tracing::warn!("Received unimplemented message type: {:?}", msg);
+                Some((peer_id, Ok(Message::Command(cmd)))) =>
+                {
+                    #[expect(clippy::match_wildcard_for_single_variants)]
+                    match cmd.name {
+                        ZmqCommandName::PING => {
+                            if let Some(heartbeat_tuple) =
+                                self.backend.heartbeats.lock().get_mut(&peer_id)
+                            {
+                                heartbeat_tuple.0.received_ping(cmd.ttl);
+                            }
+                            if let Some(mut peer) = self.backend.peers.get_async(&peer_id).await {
+                                let pong = ZmqCommand::pong(cmd.context.clone());
+                                if let Err(e) = peer.send_queue.send(Message::Command(pong)).await {
+                                    log::warn!("Failed to send PONG to peer {:?}: {}", peer_id, e);
+                                }
+                            }
+                        }
+                        ZmqCommandName::PONG => {
+                            if let Some(heartbeat_tuple) =
+                                self.backend.heartbeats.lock().get_mut(&peer_id)
+                            {
+                                heartbeat_tuple.0.received_pong();
+                            }
+                        }
+                        _ => {
+                            if let Some(heartbeat_tuple) =
+                                self.backend.heartbeats.lock().get_mut(&peer_id)
+                            {
+                                heartbeat_tuple.0.record_activity();
+                            }
+                        }
+                    }
+                }
+                Some((peer_id, Ok(Message::Greeting(_)))) => {
+                    if let Some(heartbeat_tuple) = self.backend.heartbeats.lock().get_mut(&peer_id)
+                    {
+                        heartbeat_tuple.0.record_activity();
+                    }
                 }
                 Some((peer_id, Err(_e))) => {
                     self.backend.peer_disconnected(&peer_id);
@@ -89,6 +127,21 @@ impl SocketRecv for RouterSocket {
                 }
                 None => {}
             };
+
+            // Check if any peers have timed out
+            let mut timed_out_peers = Vec::new();
+            self.backend
+                .heartbeats
+                .lock()
+                .iter()
+                .for_each(|(peer_id, heartbeat_tuple)| {
+                    if heartbeat_tuple.0.is_dead() {
+                        timed_out_peers.push(peer_id.clone());
+                    }
+                });
+            for peer_id in timed_out_peers {
+                self.backend.peer_disconnected(&peer_id);
+            }
         }
     }
 }
@@ -193,10 +246,62 @@ impl SocketRecv for RouterRecvHalf {
         loop {
             match self.fair_queue.next().await {
                 Some((peer_id, Ok(Message::Message(mut message)))) => {
+                    if let Some(heartbeat_tuple) =
+                        self.inner.backend.heartbeats.lock().get_mut(&peer_id)
+                    {
+                        let activity_tracker = &mut heartbeat_tuple.0;
+                        activity_tracker.record_activity();
+
+                        if activity_tracker.is_dead() {
+                            log::warn!("Heartbeat timeout for peer {:?}", peer_id);
+                            self.inner.backend.peer_disconnected(&peer_id);
+                        }
+                    }
                     message.push_front(peer_id.into());
                     return Ok(message);
                 }
-                Some((_peer_id, Ok(_))) => {}
+                Some((peer_id, Ok(Message::Command(cmd)))) =>
+                {
+                    #[expect(clippy::match_wildcard_for_single_variants)]
+                    match cmd.name {
+                        ZmqCommandName::PING => {
+                            if let Some(heartbeat_tuple) =
+                                self.inner.backend.heartbeats.lock().get_mut(&peer_id)
+                            {
+                                heartbeat_tuple.0.received_ping(cmd.ttl);
+                            }
+                            if let Some(mut peer) =
+                                self.inner.backend.peers.get_async(&peer_id).await
+                            {
+                                let pong = ZmqCommand::pong(cmd.context.clone());
+                                if let Err(e) = peer.send_queue.send(Message::Command(pong)).await {
+                                    log::warn!("Failed to send PONG to peer {:?}: {}", peer_id, e);
+                                }
+                            }
+                        }
+                        ZmqCommandName::PONG => {
+                            if let Some(heartbeat_tuple) =
+                                self.inner.backend.heartbeats.lock().get_mut(&peer_id)
+                            {
+                                heartbeat_tuple.0.received_pong();
+                            }
+                        }
+                        _ => {
+                            if let Some(heartbeat_tuple) =
+                                self.inner.backend.heartbeats.lock().get_mut(&peer_id)
+                            {
+                                heartbeat_tuple.0.record_activity();
+                            }
+                        }
+                    }
+                }
+                Some((peer_id, Ok(Message::Greeting(_)))) => {
+                    if let Some(heartbeat_tuple) =
+                        self.inner.backend.heartbeats.lock().get_mut(&peer_id)
+                    {
+                        heartbeat_tuple.0.record_activity();
+                    }
+                }
                 Some((peer_id, Err(_e))) => {
                     self.inner.backend.peer_disconnected(&peer_id);
                 }

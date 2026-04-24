@@ -7,6 +7,7 @@ mod dealer;
 mod endpoint;
 mod error;
 mod fair_queue;
+mod heartbeat;
 mod message;
 mod r#pub;
 mod pull;
@@ -41,6 +42,7 @@ pub use crate::sub::*;
 pub use crate::xpub::*;
 
 use crate::codec::*;
+use crate::heartbeat::HeartbeatConfig;
 use crate::transport::AcceptStopHandle;
 use util::PeerIdentity;
 
@@ -175,11 +177,28 @@ pub enum SocketEvent {
 #[derive(Default)]
 pub struct SocketOptions {
     pub(crate) peer_id: Option<PeerIdentity>,
+    pub(crate) heartbeat_enabled: bool,
+    pub(crate) heartbeat_config: Option<HeartbeatConfig>,
 }
 
 impl SocketOptions {
     pub fn peer_identity(&mut self, peer_id: PeerIdentity) -> &mut Self {
         self.peer_id = Some(peer_id);
+        self
+    }
+
+    /// Enable or disable heartbeat functionality (disabled by default)
+    pub fn heartbeat(&mut self, enabled: bool) -> &mut Self {
+        self.heartbeat_enabled = enabled;
+        self
+    }
+
+    /// Set custom heartbeat configuration
+    ///
+    /// This implicitly enables heartbeat functionality
+    pub fn heartbeat_config(&mut self, config: HeartbeatConfig) -> &mut Self {
+        self.heartbeat_config = Some(config);
+        self.heartbeat_enabled = true;
         self
     }
 }
